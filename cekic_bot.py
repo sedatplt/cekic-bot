@@ -29,13 +29,16 @@ CRYPTO = ["BTC", "ETH", "SOL", "XRP", "BNB",
 # Çoğunun başında "xyz:" olur; bazı hisseler önek olmadan yazılır (GOOGL, HOOD, TSM).
 # Adı yanlış/yok olanları bot kendisi eler ve uyarı yazar.
 US_STOCKS = ["xyz:NVDA", "xyz:TSLA", "xyz:AAPL", "xyz:MSFT", "xyz:AMZN",
-             "GOOGL", "HOOD", "TSM", "xyz:META", "xyz:AMD", "xyz:PLTR", "xyz:MU", "xyz:COIN"]
+             "xyz:GOOGL", "xyz:META", "xyz:HOOD", "xyz:TSM", "xyz:AMD", "xyz:PLTR",
+             "xyz:MU", "xyz:COIN", "xyz:MSTR", "xyz:AVGO", "xyz:CRCL", "xyz:INTC"]
 INDICES = ["xyz:XYZ100", "xyz:SP500"]            # Nasdaq-100 ve S&P 500
-COMMODITIES = ["xyz:GOLD", "xyz:SILVER", "xyz:CL", "xyz:NATGAS", "xyz:COPPER"]
+# Emtia: altın, gümüş, paladyum, bakır, ham petrol, Brent, doğalgaz, ısıtma yağı
+COMMODITIES = ["xyz:GOLD", "xyz:SILVER", "xyz:PALLADIUM", "xyz:COPPER",
+               "xyz:CL", "xyz:BRENTOIL", "xyz:NATGAS", "xyz:HO"]
 HYPERLIQUID = CRYPTO + US_STOCKS + INDICES + COMMODITIES      # veri Hyperliquid'den gelir
 # Hyperliquid'de en çok işlem gören marketlerden kaçı otomatik eklensin (0 = kapalı).
 # Dikkat: yükselttikçe tarama uzar (Hyperliquid dakikada ~50 istek sınırı koyar).
-AUTO_TOP = 10
+AUTO_TOP = 5
 AUTO_DEXES = ["", "xyz"]   # "" = kripto, "xyz" = hisse/emtia kontratları
 HL_DELAY = 1.1             # istekler arası bekleme (saniye)
 SYMBOLS = [f"{b}.IS" for b in BIST] + HYPERLIQUID
