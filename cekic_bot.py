@@ -63,20 +63,46 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 STATE_FILE = "sent.json"
 RUN_ONCE = os.environ.get("RUN_ONCE") == "1"   # GitHub Actions modu
-sent = set()  # aynı sinyali tekrar göndermemek için
+class OrderedSet:
+    """Eklenme sırasını koruyan küme (eski kayıtları doğru silebilmek için)."""
+    def __init__(self):
+        self.d = {}
+
+    def add(self, k):
+        self.d[k] = 1
+
+    def __contains__(self, k):
+        return k in self.d
+
+    def update(self, items):
+        for k in items:
+            self.d[k] = 1
+
+    def latest(self, n=500):
+        return list(self.d)[-n:]
+
+
+sent = OrderedSet()   # aynı sinyali tekrar göndermemek için
+last_scan = {}        # zaman dilimi -> en son taranan mum başlangıcı (saniye)
+TF_SECONDS = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
 
 
 def load_state():
     try:
         with open(STATE_FILE) as f:
-            sent.update(json.load(f))
+            data = json.load(f)
+        if isinstance(data, list):          # eski biçim
+            sent.update(data)
+        else:
+            sent.update(data.get("sent", []))
+            last_scan.update(data.get("last", {}))
     except (FileNotFoundError, ValueError):
         pass
 
 
 def save_state():
     with open(STATE_FILE, "w") as f:
-        json.dump(sorted(sent)[-500:], f)
+        json.dump({"sent": sent.latest(), "last": last_scan}, f)
 
 
 def candle_type(o, h, l, c):
@@ -315,7 +341,13 @@ def scan(symbol, interval, yf_interval, period, resample):
         if "Volume" in df.columns:
             agg["Volume"] = "sum"
         df = df.resample(resample).agg(agg).dropna()
-    df = df.iloc[:-1]                          # son mum henüz kapanmamış olabilir
+    # Son mum henüz kapanmadıysa (açılışı + süresi şu andan sonraysa) çıkar
+    tf_sec = TF_SECONDS.get(interval, 3600)
+    last_open = df.index[-1]
+    if getattr(last_open, "tzinfo", None) is not None:
+        last_open = last_open.tz_convert("UTC").tz_localize(None)
+    if last_open + pd.Timedelta(seconds=tf_sec) > pd.Timestamp.utcnow().tz_localize(None):
+        df = df.iloc[:-1]
     closes = df["Close"].tolist()
     hits = []
     for i in range(len(df) - LOOKBACK, len(df)):
@@ -356,6 +388,22 @@ def scan(symbol, interval, yf_interval, period, resample):
             notify(f"✅ ONAY MUMU GELDİ - {'yükseliş' if bull else 'düşüş'}\n{name}")
 
 
+def run_scan(symbols):
+    """Sadece yeni bir mumu kapanmış zaman dilimlerini tarar."""
+    now = int(time.time())
+    for iv, (yi, per, rs) in TIMEFRAMES.items():
+        boundary = now // TF_SECONDS[iv] * TF_SECONDS[iv]
+        if last_scan.get(iv, 0) >= boundary:
+            continue                        # bu zaman diliminde yeni mum yok
+        print(f"[{iv}] taranıyor...")
+        for s in symbols:
+            try:
+                scan(s, iv, yi, per, rs)
+            except Exception as e:
+                print(f"{s} {iv} hata: {e}")
+        last_scan[iv] = boundary
+
+
 def main():
     if os.environ.get("LIST_MARKETS") == "1":
         list_markets()
@@ -364,22 +412,12 @@ def main():
     symbols = build_symbols()
     print(f"{len(symbols)} sembol taranıyor.")
     if RUN_ONCE:
-        for s in symbols:
-            for iv, (yi, per, rs) in TIMEFRAMES.items():
-                try:
-                    scan(s, iv, yi, per, rs)
-                except Exception as e:
-                    print(f"{s} {iv} hata: {e}")
+        run_scan(symbols)
         save_state()
         return
     notify("Çekiç tarayıcı başladı.")
     while True:
-        for s in symbols:
-            for iv, (yi, per, rs) in TIMEFRAMES.items():
-                try:
-                    scan(s, iv, yi, per, rs)
-                except Exception as e:
-                    print(f"{s} {iv} hata: {e}")
+        run_scan(symbols)
         save_state()
         time.sleep(CHECK_EVERY)
 
