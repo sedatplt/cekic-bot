@@ -135,6 +135,11 @@ def notify(text):
 
 
 MIN_SCORE = 0   # 0-3: kalite puanı bundan düşük sinyaller gönderilmez (2 önerilir)
+# Likidite avı (liquidity sweep): bu zaman dilimlerinde çekiç yerine likidite avı aranır
+SWEEP_TFS = {"4h"}
+SWEEP_LOOKBACK = 20   # son kaç mumun dip/zirvesi "likidite" sayılsın
+SWEEP_WICK = 0.4      # avlanan iğne, mum boyunun en az bu oranı kadar olsun
+SWEEP_CHECK = 2       # son kaç kapanmış muma bakılsın (geciken çalışmaları yakalamak için)
 TREND_BARS = 6  # trendi anlamak için mumdan kaç mum geriye bakılsın
 # Trend sayılması için gereken minimum hareket (zaman dilimine göre)
 TREND_MIN = {"15m": 0.004, "1h": 0.008, "4h": 0.015, "1d": 0.03}
@@ -325,6 +330,46 @@ def quality(df, closes, idx, bull):
     return out
 
 
+def scan_sweep(symbol, interval, df):
+    """Likidite avı: önceki dip/zirveyi süpürüp geri içeri kapanan mum."""
+    tf = {"15m": "15 dk", "1h": "1 saat", "4h": "4 saat", "1d": "Günlük"}
+    name = f"{SPOT_LABEL.get(symbol) or symbol.replace('.IS', '').split(':')[-1]} - {tf.get(interval, interval)} grafik"
+    closes = df["Close"].tolist()
+    n = len(df)
+    for i in range(max(n - SWEEP_CHECK, SWEEP_LOOKBACK), n):
+        r = df.iloc[i]
+        rng = r["High"] - r["Low"]
+        if rng <= 0:
+            continue
+        w = df.iloc[i - SWEEP_LOOKBACK:i]
+        prior_low, prior_high = w["Low"].min(), w["High"].max()
+        body_low, body_high = min(r["Open"], r["Close"]), max(r["Open"], r["Close"])
+        bull = (r["Low"] < prior_low and r["Close"] > prior_low
+                and (body_low - r["Low"]) >= SWEEP_WICK * rng)
+        bear = (r["High"] > prior_high and r["Close"] < prior_high
+                and (r["High"] - body_high) >= SWEEP_WICK * rng)
+        if bull == bear:                       # ikisi de ya da hiçbiri
+            continue
+        key = f"{symbol}|{interval}|sweep|{df.index[i]}|{'b' if bull else 's'}"
+        if key not in sent:
+            sent.add(key)
+            vol = False
+            if "Volume" in df.columns and i >= 20:
+                avg = df["Volume"].iloc[i - 20:i].mean()
+                vol = bool(avg > 0 and r["Volume"] >= 1.5 * avg)
+            rsi = rsi_series(closes)[i]
+            rsi_ok = bool(rsi <= 35) if bull else bool(rsi >= 65)
+            head = "🟢 LİKİDİTE AVI - YÜKSELİŞ" if bull else "🔴 LİKİDİTE AVI - DÜŞÜŞ"
+            side = "dibi süpürüldü, mum geri yukarı kapandı" if bull else "zirvesi süpürüldü, mum geri aşağı kapandı"
+            notify(f"{head}\n{name}\nSon {SWEEP_LOOKBACK} mumun {side}.\n"
+                   f"{'✅' if vol else '❌'} Hacim  {'✅' if rsi_ok else '❌'} RSI")
+        if i + 1 < n and key + "|onay" not in sent:
+            nxt = df.iloc[i + 1]
+            if (bull and nxt["Close"] > r["High"]) or (not bull and nxt["Close"] < r["Low"]):
+                sent.add(key + "|onay")
+                notify(f"✅ ONAY MUMU GELDİ - {'yükseliş' if bull else 'düşüş'}\n{name}")
+
+
 def scan(symbol, interval, yf_interval, period, resample):
     if symbol in HYPERLIQUID:
         df = fetch_hyperliquid(symbol, interval)
@@ -348,6 +393,10 @@ def scan(symbol, interval, yf_interval, period, resample):
         last_open = last_open.tz_convert("UTC").tz_localize(None)
     if last_open + pd.Timedelta(seconds=tf_sec) > pd.Timestamp.utcnow().tz_localize(None):
         df = df.iloc[:-1]
+    if interval in SWEEP_TFS:
+        if len(df) > SWEEP_LOOKBACK + 2:
+            scan_sweep(symbol, interval, df)
+        return
     closes = df["Close"].tolist()
     hits = []
     for i in range(len(df) - LOOKBACK, len(df)):
