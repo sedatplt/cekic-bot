@@ -303,6 +303,9 @@ def fetch_hyperliquid(coin, interval, bars=120):
     return df
 
 
+WICK_MIN_RANGE = 0.5   # uzun iğne, son 14 mumun ortalama boyunun en az bu oranı kadar olsun (0 = kapalı)
+
+
 def rsi_series(closes, n=14):
     c = pd.Series(closes)
     d = c.diff()
@@ -311,63 +314,122 @@ def rsi_series(closes, n=14):
     return (100 - 100 / (1 + up / dn)).fillna(50).tolist()
 
 
-def quality(df, closes, idx, bull):
-    """Sinyal mumuna (idx) kalite kontrolleri. {ad: True/False} döner."""
+class Data:
+    """Kapanmış mumların hızlı erişilebilir hali."""
+    def __init__(self, df):
+        self.ts = list(df.index)
+        self.o = df["Open"].astype(float).tolist()
+        self.h = df["High"].astype(float).tolist()
+        self.l = df["Low"].astype(float).tolist()
+        self.c = df["Close"].astype(float).tolist()
+        self.v = df["Volume"].astype(float).tolist() if "Volume" in df.columns else None
+        self.n = len(self.c)
+        self.rsi = rsi_series(self.c)
+
+
+def closed_candles(df, interval, resample=None):
+    """Veriyi hazırlar: gerekirse birleştirir, kapanmamış son mumu çıkarır."""
+    if df is None or len(df) < LOOKBACK + TREND_BARS + 2:
+        return None
+    if hasattr(df.columns, "levels"):          # yfinance çok seviyeli sütun
+        df.columns = df.columns.get_level_values(0)
+    if resample:
+        agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+        if "Volume" in df.columns:
+            agg["Volume"] = "sum"
+        df = df.resample(resample).agg(agg).dropna()
+    last_open = df.index[-1]
+    if getattr(last_open, "tzinfo", None) is not None:
+        last_open = last_open.tz_convert("UTC").tz_localize(None)
+    now = pd.Timestamp(time.time(), unit="s")
+    if last_open + pd.Timedelta(seconds=TF_SECONDS.get(interval, 3600)) > now:
+        df = df.iloc[:-1]                      # son mum henüz kapanmadı
+    return df if len(df) > 0 else None
+
+
+def big_wick(D, i, t, wick_min=None):
+    """Uzun iğne, son 14 mumun ortalama boyuna göre belirgin mi?"""
+    wm = WICK_MIN_RANGE if wick_min is None else wick_min
+    if wm <= 0:
+        return True
+    if i < 14:
+        return False
+    avg = sum(D.h[j] - D.l[j] for j in range(i - 14, i)) / 14
+    top, bot = max(D.o[i], D.c[i]), min(D.o[i], D.c[i])
+    wick = (bot - D.l[i]) if t == "hammer" else (D.h[i] - top)
+    return avg > 0 and wick >= wm * avg
+
+
+def quality(D, i, bull):
+    """Sinyal mumuna (i) kalite kontrolleri. {ad: True/False} döner."""
     out = {}
-    if "Volume" in df.columns and idx >= 20:
-        avg = df["Volume"].iloc[idx - 20:idx].mean()
-        out["Hacim"] = bool(avg > 0 and df["Volume"].iloc[idx] >= 1.5 * avg)
+    if D.v and i >= 20:
+        avg = sum(D.v[i - 20:i]) / 20
+        out["Hacim"] = bool(avg > 0 and D.v[i] >= 1.5 * avg)
     else:
         out["Hacim"] = False
-    r = rsi_series(closes)[idx]
-    out["RSI"] = bool(r <= 35) if bull else bool(r >= 65)
-    w = df.iloc[max(0, idx - 30):idx]
-    if len(w):
+    out["RSI"] = bool(D.rsi[i] <= 35) if bull else bool(D.rsi[i] >= 65)
+    if i > 0:
+        lo = max(0, i - 30)
         if bull:
-            out["Dip seviyesi"] = bool(df["Low"].iloc[idx] <= w["Low"].min() * 1.002)
+            out["Dip seviyesi"] = bool(D.l[i] <= min(D.l[lo:i]) * 1.002)
         else:
-            out["Zirve seviyesi"] = bool(df["High"].iloc[idx] >= w["High"].max() * 0.998)
+            out["Zirve seviyesi"] = bool(D.h[i] >= max(D.h[lo:i]) * 0.998)
     return out
 
 
-def scan_sweep(symbol, interval, df):
+def hammer_signal(D, e, interval, wick_min=None):
+    """e: en son kapanmış mumun sırası. Çekiç/kayan yıldız sinyali ya da None."""
+    hits = []
+    for i in range(max(e - LOOKBACK + 1, 0), e + 1):
+        t = candle_type(D.o[i], D.h[i], D.l[i], D.c[i])
+        if not t or not big_wick(D, i, t, wick_min):
+            continue
+        tr = trend_before(D.c, i, interval)
+        # Düşüşte sadece alt iğneli (çekiç), yükselişte sadece üst iğneli
+        # (kayan yıldız) mum sayılır; ters bağlamdakiler sinyal değildir.
+        if (tr == "down" and t != "hammer") or (tr == "up" and t != "inverted"):
+            continue
+        hits.append((D.ts[i], t, tr, i))
+    if len(hits) < HIT_COUNT:
+        return None
+    trends = {h[2] for h in hits}
+    last = hits[-1][3]
+    if trends == {"flat"}:                          # yatay seyir: puanlama yok
+        return {"dir": "flat", "hits": hits, "last": last, "checks": {}}
+    if "up" in trends and "down" in trends:         # çelişkili
+        return None
+    bull = "down" in trends                         # düşüş(+yatay) -> yükseliş
+    return {"dir": "bull" if bull else "bear", "hits": hits, "last": last,
+            "checks": quality(D, last, bull)}
+
+
+def sweep_signal(D, i):
     """Likidite avı: önceki dip/zirveyi süpürüp geri içeri kapanan mum."""
+    if i < SWEEP_LOOKBACK:
+        return None
+    rng = D.h[i] - D.l[i]
+    if rng <= 0:
+        return None
+    pl, ph = min(D.l[i - SWEEP_LOOKBACK:i]), max(D.h[i - SWEEP_LOOKBACK:i])
+    bl, bh = min(D.o[i], D.c[i]), max(D.o[i], D.c[i])
+    bull = D.l[i] < pl and D.c[i] > pl and (bl - D.l[i]) >= SWEEP_WICK * rng
+    bear = D.h[i] > ph and D.c[i] < ph and (D.h[i] - bh) >= SWEEP_WICK * rng
+    if bull == bear:                                # ikisi de ya da hiçbiri
+        return None
+    vol = False
+    if D.v and i >= 20:
+        avg = sum(D.v[i - 20:i]) / 20
+        vol = bool(avg > 0 and D.v[i] >= 1.5 * avg)
+    rsi_ok = bool(D.rsi[i] <= 35) if bull else bool(D.rsi[i] >= 65)
+    return {"dir": "bull" if bull else "bear", "i": i,
+            "checks": {"Hacim": vol, "RSI": rsi_ok}}
+
+
+def display_name(symbol, interval):
     tf = {"15m": "15 dk", "1h": "1 saat", "4h": "4 saat", "1d": "Günlük"}
-    name = f"{SPOT_LABEL.get(symbol) or symbol.replace('.IS', '').split(':')[-1]} - {tf.get(interval, interval)} grafik"
-    closes = df["Close"].tolist()
-    n = len(df)
-    for i in range(max(n - SWEEP_CHECK, SWEEP_LOOKBACK), n):
-        r = df.iloc[i]
-        rng = r["High"] - r["Low"]
-        if rng <= 0:
-            continue
-        w = df.iloc[i - SWEEP_LOOKBACK:i]
-        prior_low, prior_high = w["Low"].min(), w["High"].max()
-        body_low, body_high = min(r["Open"], r["Close"]), max(r["Open"], r["Close"])
-        bull = (r["Low"] < prior_low and r["Close"] > prior_low
-                and (body_low - r["Low"]) >= SWEEP_WICK * rng)
-        bear = (r["High"] > prior_high and r["Close"] < prior_high
-                and (r["High"] - body_high) >= SWEEP_WICK * rng)
-        if bull == bear:                       # ikisi de ya da hiçbiri
-            continue
-        key = f"{symbol}|{interval}|sweep|{df.index[i]}|{'b' if bull else 's'}"
-        if key not in sent:
-            sent.add(key)
-            vol = False
-            if "Volume" in df.columns and i >= 20:
-                avg = df["Volume"].iloc[i - 20:i].mean()
-                vol = bool(avg > 0 and r["Volume"] >= 1.5 * avg)
-            rsi = rsi_series(closes)[i]
-            rsi_ok = bool(rsi <= 35) if bull else bool(rsi >= 65)
-            head = "🟢 LİKİDİTE AVI - YÜKSELİŞ" if bull else "🔴 LİKİDİTE AVI - DÜŞÜŞ"
-            side = "dibi süpürüldü, mum geri yukarı kapandı" if bull else "zirvesi süpürüldü, mum geri aşağı kapandı"
-            notify(f"{head}\n{name}\nSon {SWEEP_LOOKBACK} mumun {side}.\n"
-                   f"{'✅' if vol else '❌'} Hacim  {'✅' if rsi_ok else '❌'} RSI")
-        if i + 1 < n and key + "|onay" not in sent:
-            nxt = df.iloc[i + 1]
-            if (bull and nxt["Close"] > r["High"]) or (not bull and nxt["Close"] < r["Low"]):
-                sent.add(key + "|onay")
-                notify(f"✅ ONAY MUMU GELDİ - {'yükseliş' if bull else 'düşüş'}\n{name}")
+    base = SPOT_LABEL.get(symbol) or symbol.replace(".IS", "").split(":")[-1]
+    return f"{base} - {tf.get(interval, interval)} grafik"
 
 
 def scan(symbol, interval, yf_interval, period, resample):
@@ -377,50 +439,47 @@ def scan(symbol, interval, yf_interval, period, resample):
     else:
         df = yf.download(symbol, interval=yf_interval, period=period,
                          progress=False, auto_adjust=False)
-    if df is None or len(df) < LOOKBACK + TREND_BARS + 2:
+    df = closed_candles(df, interval, resample)
+    if df is None:
         return
-    if hasattr(df.columns, "levels"):          # yfinance çok seviyeli sütun
-        df.columns = df.columns.get_level_values(0)
-    if resample:
-        agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
-        if "Volume" in df.columns:
-            agg["Volume"] = "sum"
-        df = df.resample(resample).agg(agg).dropna()
-    # Son mum henüz kapanmadıysa (açılışı + süresi şu andan sonraysa) çıkar
-    tf_sec = TF_SECONDS.get(interval, 3600)
-    last_open = df.index[-1]
-    if getattr(last_open, "tzinfo", None) is not None:
-        last_open = last_open.tz_convert("UTC").tz_localize(None)
-    if last_open + pd.Timedelta(seconds=tf_sec) > pd.Timestamp.utcnow().tz_localize(None):
-        df = df.iloc[:-1]
-    if interval in SWEEP_TFS:
-        if len(df) > SWEEP_LOOKBACK + 2:
-            scan_sweep(symbol, interval, df)
+    D = Data(df)
+    n = D.n
+    name = display_name(symbol, interval)
+
+    if interval in SWEEP_TFS:                       # 4 saatlik: likidite avı
+        if n <= SWEEP_LOOKBACK + 2:
+            return
+        for i in range(max(n - SWEEP_CHECK, SWEEP_LOOKBACK), n):
+            sg = sweep_signal(D, i)
+            if not sg:
+                continue
+            bull = sg["dir"] == "bull"
+            key = f"{symbol}|{interval}|sweep|{D.ts[i]}|{'b' if bull else 's'}"
+            if key not in sent:
+                sent.add(key)
+                head = "🟢 LİKİDİTE AVI - YÜKSELİŞ" if bull else "🔴 LİKİDİTE AVI - DÜŞÜŞ"
+                side = "dibi süpürüldü, mum geri yukarı kapandı" if bull else "zirvesi süpürüldü, mum geri aşağı kapandı"
+                chk = "  ".join(("✅ " if v else "❌ ") + k for k, v in sg["checks"].items())
+                notify(f"{head}\n{name}\nSon {SWEEP_LOOKBACK} mumun {side}.\n{chk}")
+            if i + 1 < n and key + "|onay" not in sent:
+                nxt = D.c[i + 1]
+                if (bull and nxt > D.h[i]) or (not bull and nxt < D.l[i]):
+                    sent.add(key + "|onay")
+                    notify(f"✅ ONAY MUMU GELDİ - {'yükseliş' if bull else 'düşüş'}\n{name}")
         return
-    closes = df["Close"].tolist()
-    hits = []
-    for i in range(len(df) - LOOKBACK, len(df)):
-        r = df.iloc[i]
-        t = candle_type(r["Open"], r["High"], r["Low"], r["Close"])
-        if t:
-            hits.append((df.index[i], t, trend_before(closes, i, interval), i))
-    if len(hits) < HIT_COUNT:
+
+    sg = hammer_signal(D, n - 1, interval)          # diğerleri: çekiç / kayan yıldız
+    if not sg:
         return
-    key = f"{symbol}|{interval}|" + ",".join(str(h[0]) for h in hits)
-    trends = {h[2] for h in hits}
-    tf = {"15m": "15 dk", "1h": "1 saat", "4h": "4 saat", "1d": "Günlük"}
-    name = f"{SPOT_LABEL.get(symbol) or symbol.replace('.IS', '').split(':')[-1]} - {tf.get(interval, interval)} grafik"
-    last = hits[-1][3]
-    if trends == {"flat"}:                          # yatay seyir: puanlama yok
+    key = f"{symbol}|{interval}|" + ",".join(str(h[0]) for h in sg["hits"])
+    if sg["dir"] == "flat":
         if key not in sent:
             sent.add(key)
             notify(f"⚪ KIRILIM SİNYALİ (yatay seyir)\n{name}")
         return
-    if "up" in trends and "down" in trends:         # çelişkili: gönderme
-        return
-    bull = "down" in trends                         # düşüş(+yatay) -> yükseliş
+    bull = sg["dir"] == "bull"
     head = "🟢 YÜKSELİŞ SİNYALİ" if bull else "🔴 DÜŞÜŞ SİNYALİ"
-    q = quality(df, closes, last, bull)
+    q = sg["checks"]
     score = sum(q.values())
     if score < MIN_SCORE:
         return
@@ -429,12 +488,111 @@ def scan(symbol, interval, yf_interval, period, resample):
         stars = "⭐" * score + "☆" * (len(q) - score)
         checks = "  ".join(("✅ " if v else "❌ ") + k for k, v in q.items())
         notify(f"{head}  {stars}\n{name}\n{checks}")
-    # onay mumu: sinyal mumundan sonraki mum, sinyal yönünde kapandı mı?
-    if last + 1 < len(df) and key + "|onay" not in sent:
-        nxt, sig = df.iloc[last + 1], df.iloc[last]
-        if (bull and nxt["Close"] > sig["High"]) or (not bull and nxt["Close"] < sig["Low"]):
+    last = sg["last"]
+    if last + 1 < n and key + "|onay" not in sent:   # onay mumu
+        nxt = D.c[last + 1]
+        if (bull and nxt > D.h[last]) or (not bull and nxt < D.l[last]):
             sent.add(key + "|onay")
             notify(f"✅ ONAY MUMU GELDİ - {'yükseliş' if bull else 'düşüş'}\n{name}")
+
+
+# ---------------- Geçmiş testi ----------------
+BT_BARS = {"15m": 3000, "1h": 3000, "4h": 2000, "1d": 700}   # kaç mum geriye gidilsin
+BT_DELAY = 4.0                                               # istekler arası bekleme (büyük veri)
+HORIZONS = (4, 8, 16)                                        # sinyalden kaç mum sonra bakılsın
+
+
+def backtest():
+    """Aynı kuralları geçmiş veride çalıştırır, sinyalden sonra fiyatın yön tutma oranını ölçer."""
+    global HL_DELAY
+    symbols = [s for s in build_symbols() if s in HYPERLIQUID]
+    HL_DELAY = BT_DELAY
+    stats, base = {}, {}
+    maxh = max(HORIZONS)
+
+    def record(key, D, e, sign):
+        st = stats.setdefault(key, {"n": 0, "win": [0] * len(HORIZONS)})
+        st["n"] += 1
+        for hi, H in enumerate(HORIZONS):
+            if (D.c[e + H] / D.c[e] - 1) * sign > 0:
+                st["win"][hi] += 1
+
+    for tf in TIMEFRAMES:
+        for sym in symbols:
+            try:
+                df = fetch_hyperliquid(sym, tf, BT_BARS[tf])
+                df = closed_candles(df, tf, None)
+            except Exception as e:
+                print(f"{sym} {tf} test verisi alınamadı: {e}")
+                continue
+            if df is None or len(df) < 100:
+                continue
+            D = Data(df)
+            b = base.setdefault(tf, [[0, 0] for _ in HORIZONS])
+            for e in range(0, D.n - maxh):               # rastgele an (taban oranı)
+                for hi, H in enumerate(HORIZONS):
+                    b[hi][0] += D.c[e + H] > D.c[e]
+                    b[hi][1] += 1
+            for e in range(40, D.n - maxh):
+                if tf in SWEEP_TFS:
+                    sg = sweep_signal(D, e)
+                    if sg:
+                        sign = 1 if sg["dir"] == "bull" else -1
+                        sc = sum(sg["checks"].values())
+                        record((tf, "sweep", sg["dir"], "tümü"), D, e, sign)
+                        if sc >= 1:
+                            record((tf, "sweep", sg["dir"], "★1+"), D, e, sign)
+                else:
+                    for variant, wm in (("filtreli", WICK_MIN_RANGE), ("filtresiz", 0)):
+                        sg = hammer_signal(D, e, tf, wm)
+                        if sg and sg["last"] == e and sg["dir"] in ("bull", "bear"):
+                            sign = 1 if sg["dir"] == "bull" else -1
+                            sc = sum(sg["checks"].values())
+                            record((tf, variant, sg["dir"], "tümü"), D, e, sign)
+                            if sc >= 2:
+                                record((tf, variant, sg["dir"], "★2+"), D, e, sign)
+        print(f"{tf} tamamlandı.")
+
+    tfname = {"15m": "15 dk", "1h": "1 saat", "4h": "4 saat", "1d": "Günlük"}
+
+    def fmt(key, sign_up):
+        st = stats.get(key)
+        if not st or st["n"] == 0:
+            return "sinyal yok"
+        tf = key[0]
+        parts = []
+        for hi, H in enumerate(HORIZONS):
+            hit = st["win"][hi] / st["n"] * 100
+            up = base[tf][hi][0] / max(base[tf][hi][1], 1) * 100
+            ref = up if sign_up else 100 - up
+            parts.append(f"{H}m %{hit:.0f}(taban %{ref:.0f})")
+        warn = " ⚠️az veri" if st["n"] < 30 else ""
+        return f"{st['n']} sinyal: " + " · ".join(parts) + warn
+
+    out = ["📊 GEÇMİŞ TESTİ (son birkaç hafta/ay, " + str(len(symbols)) + " market)",
+           "Rakam = sinyalden X mum sonra fiyatın sinyal yönünde olma oranı. Parantez = rastgele bir anda aynı yönde olma oranı. Fark ne kadar büyükse sinyal o kadar işe yarıyor."]
+    for tf in TIMEFRAMES:
+        out.append(f"\n— {tfname[tf]} —")
+        if tf in SWEEP_TFS:
+            for d, lab, up in (("bull", "🟢 dip avı", True), ("bear", "🔴 zirve avı", False)):
+                for tier in ("tümü", "★1+"):
+                    out.append(f"{lab} {tier}: " + fmt((tf, "sweep", d, tier), up))
+        else:
+            for variant in ("filtreli", "filtresiz"):
+                for d, lab, up in (("bull", "🟢 yükseliş", True), ("bear", "🔴 düşüş", False)):
+                    tiers = ("tümü", "★2+") if variant == "filtreli" else ("tümü",)
+                    for tier in tiers:
+                        out.append(f"{variant} {lab} {tier}: " + fmt((tf, variant, d, tier), up))
+    out.append("\nNot: geçmiş sonuç geleceği garanti etmez; komisyon ve stop dahil değildir. 30'dan az sinyalli satırlara güvenme.")
+    text = "\n".join(out)
+    chunk = ""
+    for line in text.split("\n"):
+        if len(chunk) + len(line) > 3500:
+            notify(chunk)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk.strip():
+        notify(chunk)
 
 
 def run_scan(symbols):
@@ -454,6 +612,9 @@ def run_scan(symbols):
 
 
 def main():
+    if os.environ.get("BACKTEST") == "1":
+        backtest()
+        return
     if os.environ.get("LIST_MARKETS") == "1":
         list_markets()
         return
