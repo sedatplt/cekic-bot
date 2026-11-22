@@ -1,0 +1,28 @@
+name: Strateji Testi
+on: workflow_dispatch
+permissions:
+  contents: write
+concurrency:
+  group: strateji-test
+  cancel-in-progress: false
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy requests
+      - run: python strateji_botu.py
+        env:
+          MODE: backtest
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      - name: Sonucu kaydet
+        run: |
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add strategy_config.json || true
+          git diff --cached --quiet || (git commit -m "strateji testi sonucu" && git push)
