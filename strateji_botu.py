@@ -4,7 +4,7 @@ STRATEJİ BOTU  -  Yön -> Geri çekilme -> Mum tetiği  (günde ~3 işlem hedef
 MODE ortam değişkeni:
   backtest : stratejiyi geçmiş veride işlem işlem simüle eder, eşiği/çıkış tipini seçer,
              sonuçları Telegram'a yazar ve strategy_config.json'u günceller.
-  scan     : her yeni 1 saatlik mum kapanışında sinyal arar (giriş/stop/hedef/boyut mesajı),
+  scan     : her yeni tetik mumu kapanışında sinyal arar (giriş/stop/hedef/boyut mesajı),
              sanal pozisyonları takip eder ve çıkışları bildirir.
   list     : Hyperliquid market adlarını Telegram'a gönderir.
 
@@ -35,13 +35,12 @@ AUTO_DEXES = ["", "xyz"]
 AUTO_TOP = 10                  # hacme göre eklenecek ek market sayısı
 
 # --- strateji ---
-DON_N = (10, 20, 40, 80)       # 4 saatlik Donchian pencereleri (çoklu model)
+DON_N = (10, 20, 40, 80)       # trend zaman diliminde Donchian pencereleri (çoklu model)
 TREND_MIN = 0.5                # |trend skoru| bu değerin altındaysa işlem yok
 PB_LOOK, PB_MIN = 12, 1.0      # geri çekilme: son 12 mumun zirvesinden >= 1 ATR
 STOP_MIN_ATR, STOP_MAX_ATR = 1.0, 3.0
 TRAIL_ATR = 3.0                # iz süren stop mesafesi (ATR)
 R_TARGET = 2.0                 # sabit hedef modunda hedef (R)
-MAX_BARS = 48                  # en fazla 48 mum (saat) açık kalsın
 COST = 0.001                   # gidiş-dönüş maliyet varsayımı (%0,10)
 TARGET_PER_DAY = 3.0           # hedef ortalama işlem/gün
 MAX_PER_DAY = 5                # günlük üst sınır
@@ -59,13 +58,23 @@ RISK_PCT = 1.0                 # işlem başına hesap riski (%)
 MAX_LEV = 5.0
 PAPER = os.environ.get("PAPER", "1") == "1"   # doğrulanmamışsa "kağıt işlem" olarak bildir
 
-TF_SEC = {"1h": 3600, "4h": 14400}
+TF_SEC = {"1h": 3600, "4h": 14400, "1d": 86400}
+TF_NAME = {"1h": "1 saat", "4h": "4 saat", "1d": "günlük"}
+# PROFIL: tetik (formasyon) ve trend zaman dilimleri. 1h profili test edildi ve başarısız oldu.
+PROFILES = {
+    "1h": {"trig": "1h", "trend": "4h", "max_bars": 48},   # 2 gün
+    "4h": {"trig": "4h", "trend": "1d", "max_bars": 42},   # 7 gün
+}
+PROFILE = os.environ.get("PROFILE", "4h")
+TRIG_TF = PROFILES[PROFILE]["trig"]
+TREND_TF = PROFILES[PROFILE]["trend"]
+MAX_BARS = PROFILES[PROFILE]["max_bars"]
 WEIGHT_BUDGET = 1000
 API_URL = "https://api.hyperliquid.xyz/info"
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-CONFIG_FILE = "strategy_config.json"
-STATE_FILE = "strateji_state.json"
+CONFIG_FILE = f"strategy_config_{PROFILE}.json"
+STATE_FILE = f"strateji_state_{PROFILE}.json"
 
 
 # =====================================================================
@@ -315,7 +324,7 @@ def compute_triggers(A):
 #  STRATEJİ: yön (4s) + geri çekilme (1s) + tetik + skor
 # =====================================================================
 def trend_score(A4):
-    """4 saatlik çoklu Donchian orta-çizgi skoru, [-1, +1]."""
+    """Trend zaman diliminde çoklu Donchian orta-çizgi skoru, [-1, +1]."""
     s = np.zeros(A4.n)
     for N in DON_N:
         mid = (rmax(A4.h, N) + rmin(A4.l, N)) / 2
@@ -325,8 +334,8 @@ def trend_score(A4):
 
 
 def align_trend(A1, A4, s4):
-    """Her 1 saatlik mumun kapanışında, o ana kadar KAPANMIŞ son 4 saatlik mumun skoru."""
-    k = np.searchsorted(A4.ts + TF_SEC["4h"], A1.ts + TF_SEC["1h"], side="right") - 1
+    """Her tetik mumunun kapanışında, o ana kadar KAPANMIŞ son trend mumunun skoru."""
+    k = np.searchsorted(A4.ts + TF_SEC[TREND_TF], A1.ts + TF_SEC[TRIG_TF], side="right") - 1
     out = np.where(k >= 0, s4[np.clip(k, 0, None)], np.nan)
     return out
 
@@ -436,8 +445,9 @@ def make_candidates(sym, A1, d, score, dist, mode):
             continue
         j, R_gross, risk_frac = r
         R_net = R_gross - COST / risk_frac
-        out.append({"sym": sym, "entry_ts": float(A1.ts[t + 1]), "exit_ts": float(A1.ts[j] + TF_SEC["1h"]),
-                    "score": float(score[t]), "R": float(R_net), "dir": int(d[t])})
+        out.append({"sym": sym, "entry_ts": float(A1.ts[t + 1]), "exit_ts": float(A1.ts[j] + TF_SEC[TRIG_TF]),
+                    "score": float(score[t]), "R": float(R_net), "dir": int(d[t]),
+                    "cost_R": float(COST / risk_frac)})
     return out
 
 
@@ -473,7 +483,7 @@ def stats(trades, t0, t1):
     days = max(1.0, (t1 - t0) / 86400)
     if not ts:
         return {"n": 0, "per_day": 0.0, "win": 0.0, "avg": 0.0, "pf": 0.0, "dd": 0.0, "t": 0.0,
-                "series": [0.0] * int(days)}
+                "series": [0.0] * int(days), "cost": 0.0}
     R = [x["R"] for x in ts]
     wins = [r for r in R if r > 0]
     losses = [-r for r in R if r <= 0]
@@ -491,7 +501,8 @@ def stats(trades, t0, t1):
         dd = min(dd, cum - peak)
     return {"n": len(ts), "per_day": len(ts) / days, "win": len(wins) / len(ts), "avg": sum(R) / len(R),
             "pf": (sum(wins) / sum(losses)) if losses and sum(losses) > 0 else float("inf"),
-            "dd": dd, "t": mu / (sd / math.sqrt(nd)), "series": series}
+            "dd": dd, "t": mu / (sd / math.sqrt(nd)), "series": series,
+            "cost": sum(x["cost_R"] for x in ts) / len(ts)}
 
 
 def paired_t(a, b):
@@ -508,7 +519,8 @@ def paired_t(a, b):
 def fmt_stats(s):
     if s["n"] == 0:
         return "işlem yok"
-    return (f"{s['n']} işlem ({s['per_day']:.1f}/gün) · kazanç %{s['win'] * 100:.0f} · ort. {s['avg']:+.2f}R · "
+    return (f"{s['n']} işlem ({s['per_day']:.1f}/gün) · kazanç %{s['win'] * 100:.0f} · ort. {s['avg']:+.2f}R "
+            f"(maliyetten önce {s['avg'] + s['cost']:+.2f}R, maliyet {s['cost']:.2f}R) · "
             f"PF {min(s['pf'], 99):.2f} · maks. düşüş {s['dd']:.1f}R · t={s['t']:.1f}")
 
 
@@ -517,12 +529,12 @@ def fmt_stats(s):
 # =====================================================================
 def load_all(symbols, bars1=5000):
     data = {}
-    bars4 = bars1 // 4 + 150
-    btc4 = fetch_candles("BTC", "4h", bars4)
+    bars4 = bars1 * TF_SEC[TRIG_TF] // TF_SEC[TREND_TF] + 150
+    btc4 = fetch_candles("BTC", TREND_TF, bars4)
     for sym in symbols:
         try:
-            A1 = fetch_candles(sym, "1h", bars1)
-            A4 = btc4 if sym == "BTC" else fetch_candles(sym, "4h", bars4)
+            A1 = fetch_candles(sym, TRIG_TF, bars1)
+            A4 = btc4 if sym == "BTC" else fetch_candles(sym, TREND_TF, bars4)
         except Exception as e:
             print(f"{sym} verisi alınamadı: {e}")
             continue
@@ -611,6 +623,7 @@ def run_backtest(data=None, btc4=None, quiet=False):
     with open(CONFIG_FILE, "w") as f:
         json.dump(cfg_out, f, ensure_ascii=False, indent=1)
     rep = ["📈 STRATEJİ TESTİ: Yön → Geri çekilme → Mum tetiği",
+           f"Profil {PROFILE}: tetik {TF_NAME[TRIG_TF]} · trend {TF_NAME[TREND_TF]} · en fazla {MAX_BARS} mum açık",
            f"{len(data)} market · {ndays:.0f} gün · keşif %{int(DISC_FRAC * 100)} / bağımsız doğrulama %{100 - int(DISC_FRAC * 100)}",
            f"Hedef: günde ~{TARGET_PER_DAY:.0f} işlem · maliyet %{COST * 100:.2f} · 1R = stop mesafesi",
            "",
@@ -702,18 +715,18 @@ def run_scan():
     thr = cfg.get("threshold", 60)
     mode = cfg.get("exit_mode", "r2")
     now = int(time.time())
-    boundary = now // 3600 * 3600
+    boundary = now // TF_SEC[TRIG_TF] * TF_SEC[TRIG_TF]
     if state.get("last", 0) >= boundary:
         return
     tag = "" if validated else "📝 KAĞIT İŞLEM (strateji doğrulanmadı, gerçek işlem açma) — "
     syms = build_symbols()
-    btc4 = fetch_candles("BTC", "4h", 160)
+    btc4 = fetch_candles("BTC", TREND_TF, 160)
     btc_s4 = trend_score(btc4) if btc4 is not None else None
     cands, books = [], {}
     for sym in syms:
         try:
-            A1 = fetch_candles(sym, "1h", 150)
-            A4 = btc4 if sym == "BTC" else fetch_candles(sym, "4h", 160)
+            A1 = fetch_candles(sym, TRIG_TF, 150)
+            A4 = btc4 if sym == "BTC" else fetch_candles(sym, TREND_TF, 160)
         except Exception as e:
             print(f"{sym} hata: {e}")
             continue
@@ -744,6 +757,7 @@ def run_scan():
                 pos.update(new_pos(pos["d"], float(A1.o[j]), p["dist"], mode))
                 pos["bars"] = 0
                 p["entered"] = True
+                p["sent_stop"] = pos["stop"]                # stop güncellemesi bu seviyeye göre ölçülür
             res = advance(pos, float(A1.o[j]), float(A1.h[j]), float(A1.l[j]), float(A1.c[j]), float(A1.atr[j]), first)
             p["done_ts"] = float(A1.ts[j])
             if res:
@@ -778,10 +792,10 @@ def run_scan():
         risk_usd, notional, lev, note = sizing(close, dist)
         exit_txt = ("iz süren stop (bot stop güncellemelerini yazar)" if mode == "trail"
                     else f"hedef {fmt_px(close + d * R_TARGET * dist)} ({R_TARGET:.0f}R)")
-        notify(f"{tag}{'🟢 LONG' if d == 1 else '🔴 SHORT'} — {sym.split(':')[-1]} (1 saat) · skor {score:.0f}\n"
+        notify(f"{tag}{'🟢 LONG' if d == 1 else '🔴 SHORT'} — {sym.split(':')[-1]} ({TF_NAME[TRIG_TF]}) · skor {score:.0f}\n"
                f"Tetik: {', '.join(names)}\n"
                f"Giriş: piyasa ≈ {fmt_px(close)} · Stop: {fmt_px(stop)} ({dist / close * 100:.1f}%)\n"
-               f"Çıkış: {exit_txt} · en fazla {MAX_BARS} saat\n"
+               f"Çıkış: {exit_txt} · en fazla {MAX_BARS * TF_SEC[TRIG_TF] // 3600} saat\n"
                f"Boyut: risk ${risk_usd:.2f} → pozisyon ≈ ${notional:.0f} ({lev:.1f}x){note}")
         state["open"].append({"sym": sym, "signal_ts": float(sig_ts), "dist": dist,
                               "pos": new_pos(d, close, dist, mode), "entered": False})
