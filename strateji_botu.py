@@ -57,6 +57,8 @@ ACCOUNT_USD = float(os.environ.get("ACCOUNT_USD", "100"))
 RISK_PCT = 1.0                 # işlem başına hesap riski (%)
 MAX_LEV = 5.0
 PAPER = os.environ.get("PAPER", "1") == "1"   # doğrulanmamışsa "kağıt işlem" olarak bildir
+NOTIFY_MIN_SCORE = int(os.environ.get("NOTIFY_MIN_SCORE", "60"))   # bundan düşük skorlu fikirler gösterilmez
+STOP_UPDATES = os.environ.get("STOP_UPDATES", "0") == "1"          # iz süren stop güncellemeleri mesaj olarak gelsin mi
 
 TF_SEC = {"1h": 3600, "4h": 14400, "1d": 86400}
 TF_NAME = {"1h": "1 saat", "4h": "4 saat", "1d": "günlük"}
@@ -718,7 +720,6 @@ def run_scan():
     boundary = now // TF_SEC[TRIG_TF] * TF_SEC[TRIG_TF]
     if state.get("last", 0) >= boundary:
         return
-    tag = "" if validated else "📝 KAĞIT İŞLEM (strateji doğrulanmadı, gerçek işlem açma) — "
     syms = build_symbols()
     btc4 = fetch_candles("BTC", TREND_TF, 160)
     btc_s4 = trend_score(btc4) if btc4 is not None else None
@@ -737,10 +738,11 @@ def run_scan():
         btc_1 = align_trend(A1, btc4, btc_s4) if (btc4 is not None and sym in CRYPTO and sym != "BTC") else None
         d, score, dist, P = gen_signals(A1, s4, btc_1)
         t = A1.n - 1
-        if d[t] != 0 and score[t] >= thr and dist[t] > 0:
+        if d[t] != 0 and score[t] >= max(thr, NOTIFY_MIN_SCORE) and dist[t] > 0:
             names = [TRIG_NAME[k] for k in (TRIG_LONG if d[t] == 1 else TRIG_SHORT) if P[k][t]]
             cands.append((float(score[t]), sym, int(d[t]), float(dist[t]), float(A1.c[t]), names, int(A1.ts[t])))
     # --- açık sanal pozisyonları güncelle ---
+    new_lines, closed_lines, stop_lines = [], [], []
     still = []
     for p in state["open"]:
         A1 = books.get(p["sym"])
@@ -765,13 +767,13 @@ def run_scan():
                 R = (px - pos["entry"]) * pos["d"] / p["dist"] - COST / (p["dist"] / pos["entry"])
                 state["paper"]["n"] += 1
                 state["paper"]["R"] += R
-                notify(f"🏁 {p['sym'].split(':')[-1]} {'LONG' if pos['d'] == 1 else 'SHORT'} kapandı ({why}): "
-                       f"{R:+.2f}R (maliyet dahil)\nİleri test toplamı: {state['paper']['R']:+.1f}R / {state['paper']['n']} işlem")
+                closed_lines.append(f"🏁 {p['sym'].split(':')[-1]} {'LONG' if pos['d'] == 1 else 'SHORT'} kapandı ({why}): {R:+.2f}R")
                 closed = True
                 break
             if mode == "trail" and (pos["stop"] - p.get("sent_stop", pos["stop"])) * pos["d"] >= 0.5 * p["dist"]:
                 p["sent_stop"] = pos["stop"]
-                notify(f"🔧 STOP GÜNCELLE: {p['sym'].split(':')[-1]} yeni stop {fmt_px(pos['stop'])}")
+                if STOP_UPDATES:
+                    stop_lines.append(f"🔧 {p['sym'].split(':')[-1]} yeni stop {fmt_px(pos['stop'])}")
         if not closed:
             still.append(p)
     state["open"] = still
@@ -790,17 +792,25 @@ def run_scan():
         count += 1
         stop = close - d * dist
         risk_usd, notional, lev, note = sizing(close, dist)
-        exit_txt = ("iz süren stop (bot stop güncellemelerini yazar)" if mode == "trail"
-                    else f"hedef {fmt_px(close + d * R_TARGET * dist)} ({R_TARGET:.0f}R)")
-        notify(f"{tag}{'🟢 LONG' if d == 1 else '🔴 SHORT'} — {sym.split(':')[-1]} ({TF_NAME[TRIG_TF]}) · skor {score:.0f}\n"
-               f"Tetik: {', '.join(names)}\n"
-               f"Giriş: piyasa ≈ {fmt_px(close)} · Stop: {fmt_px(stop)} ({dist / close * 100:.1f}%)\n"
-               f"Çıkış: {exit_txt} · en fazla {MAX_BARS * TF_SEC[TRIG_TF] // 3600} saat\n"
-               f"Boyut: risk ${risk_usd:.2f} → pozisyon ≈ ${notional:.0f} ({lev:.1f}x){note}")
+        tgt = fmt_px(close + d * R_TARGET * dist)
+        new_lines.append(f"{'🟢 LONG' if d == 1 else '🔴 SHORT'} {sym.split(':')[-1]} · skor {score:.0f} · {names[0]} · "
+                         f"giriş ≈ {fmt_px(close)} · stop {fmt_px(stop)} ({dist / close * 100:.1f}%) · hedef {tgt} · "
+                         f"risk ${risk_usd:.0f} → ≈${notional:.0f}{note}")
         state["open"].append({"sym": sym, "signal_ts": float(sig_ts), "dist": dist,
                               "pos": new_pos(d, close, dist, mode), "entered": False})
     state["day"] = {today: count}
     state["last"] = boundary
+    if new_lines or closed_lines or stop_lines:
+        head = "📋 " + TF_NAME[TRIG_TF].upper() + " ÖZETİ" + ("" if validated else " (kağıt işlem: strateji kanıtlanmadı, bilgi amaçlı)")
+        parts = [head]
+        if new_lines:
+            parts += ["Yeni fikirler:"] + new_lines
+        if closed_lines:
+            parts += ["Kapananlar:"] + closed_lines
+        if stop_lines:
+            parts += ["Stop güncelle:"] + stop_lines
+        parts.append(f"İleri test toplamı: {state['paper']['R']:+.1f}R / {state['paper']['n']} işlem")
+        notify("\n".join(parts))
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
