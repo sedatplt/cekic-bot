@@ -21,6 +21,9 @@ jobs:
       - run: python strateji_botu.py
         env:
           MODE: scan
+          PROFILE: "4h"
+          NOTIFY_MIN_SCORE: ${{ vars.NOTIFY_MIN_SCORE || '60' }}
+          STOP_UPDATES: ${{ vars.STOP_UPDATES || '0' }}
           ACCOUNT_USD: ${{ vars.ACCOUNT_USD || '100' }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -28,5 +31,5 @@ jobs:
         run: |
           git config user.name "bot"
           git config user.email "bot@users.noreply.github.com"
-          git add strateji_state.json || true
+          git add strateji_state_4h.json || true
           git diff --cached --quiet || (git commit -m "state" && git push)
